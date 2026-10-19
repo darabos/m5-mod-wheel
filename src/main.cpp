@@ -1,12 +1,19 @@
 #include <M5Unified.h>
+#include <USB.h>
+#include <esp32-hal-tinyusb.h>
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include <BLEMIDI_Transport.h>
 #include <hardware/BLEMIDI_ESP32.h>
 
 BLEMIDI_CREATE_INSTANCE("M5 Mod Wheel", MIDI)
+
+#if !CFG_TUD_MIDI
+#error "The selected ESP32-S3 framework must enable TinyUSB MIDI"
+#endif
 
 namespace
 {
@@ -22,18 +29,49 @@ enum class WheelMode : uint8_t
     PitchBend,
 };
 
+enum class MidiTransport : uint8_t
+{
+    None,
+    Usb,
+    Bluetooth,
+};
+
 volatile bool midiConnected = false;
 bool bleStarted = false;
 bool pairingRequested = false;
+bool usbMidiStarted = false;
 bool hasTiltReading = false;
 bool hasZeroPose = false;
 bool hasSentMidiValue = false;
 bool previousMidiConnected = false;
+MidiTransport activeTransport = MidiTransport::None;
 WheelMode wheelMode = WheelMode::ModWheel;
 float filteredTiltDegrees = 0.0f;
 float zeroTiltDegrees = 0.0f;
 int32_t lastSentMidiValue = 0;
 uint32_t nextDisplayRefreshMs = 0;
+
+uint16_t loadMidiDescriptor(uint8_t *destination, uint8_t *interfaceNumber)
+{
+    const uint8_t endpoint = tinyusb_get_free_duplex_endpoint();
+    if (endpoint == 0)
+    {
+        return 0;
+    }
+
+    const uint8_t stringIndex = tinyusb_add_string_descriptor("M5 Mod Wheel MIDI");
+    const uint8_t descriptor[TUD_MIDI_DESC_LEN] = {
+        TUD_MIDI_DESCRIPTOR(
+            *interfaceNumber,
+            stringIndex,
+            endpoint,
+            static_cast<uint8_t>(0x80 | endpoint),
+            64)};
+
+    *interfaceNumber += 2;
+    std::memcpy(destination, descriptor, sizeof(descriptor));
+    return sizeof(descriptor);
+}
 
 void onMidiConnected()
 {
@@ -82,6 +120,35 @@ void startPairing()
     bleStarted = true;
     pairingRequested = true;
     Serial.println("BLE MIDI advertising started");
+}
+
+bool startUsbMidi()
+{
+    if (!USB.productName("M5 Mod Wheel") ||
+        !USB.manufacturerName("M5 Mod Wheel"))
+    {
+        Serial.println("ERROR: Could not configure USB MIDI identity");
+        return false;
+    }
+
+    if (tinyusb_enable_interface(
+            USB_INTERFACE_MIDI,
+            TUD_MIDI_DESC_LEN,
+            loadMidiDescriptor) != ESP_OK)
+    {
+        Serial.println("ERROR: Could not register USB MIDI interface");
+        return false;
+    }
+
+    if (!USB.begin())
+    {
+        Serial.println("ERROR: Could not start USB MIDI");
+        return false;
+    }
+
+    usbMidiStarted = true;
+    Serial.println("USB MIDI started");
+    return true;
 }
 
 void setZeroPoseAndMode()
@@ -141,14 +208,60 @@ int32_t wheelMidiValue(float position)
 
 void sendWheelValue(int32_t midiValue)
 {
-    if (!bleStarted || !midiConnected || (hasSentMidiValue && midiValue == lastSentMidiValue))
+    const MidiTransport transport = tud_midi_mounted()
+                                        ? MidiTransport::Usb
+                                        : (bleStarted && midiConnected
+                                               ? MidiTransport::Bluetooth
+                                               : MidiTransport::None);
+    if (transport != activeTransport)
+    {
+        activeTransport = transport;
+        hasSentMidiValue = false;
+        Serial.println(transport == MidiTransport::Usb
+                           ? "MIDI output: USB"
+                           : transport == MidiTransport::Bluetooth
+                                 ? "MIDI output: Bluetooth"
+                                 : "MIDI output: none");
+    }
+
+    if (transport == MidiTransport::None ||
+        (hasSentMidiValue && midiValue == lastSentMidiValue))
     {
         return;
     }
 
+    uint8_t status = 0;
+    uint8_t data1 = 0;
+    uint8_t data2 = 0;
+    uint8_t cin = 0;
+
     if (wheelMode == WheelMode::ModWheel)
     {
-        MIDI.sendControlChange(MOD_WHEEL_CC, static_cast<uint8_t>(midiValue), MIDI_CHANNEL);
+        status = static_cast<uint8_t>(0xB0 | (MIDI_CHANNEL - 1));
+        data1 = MOD_WHEEL_CC;
+        data2 = static_cast<uint8_t>(midiValue);
+        cin = 0x0B;
+    }
+    else
+    {
+        const uint16_t bend = static_cast<uint16_t>(midiValue + 8192);
+        status = static_cast<uint8_t>(0xE0 | (MIDI_CHANNEL - 1));
+        data1 = static_cast<uint8_t>(bend & 0x7F);
+        data2 = static_cast<uint8_t>((bend >> 7) & 0x7F);
+        cin = 0x0E;
+    }
+
+    if (transport == MidiTransport::Usb)
+    {
+        const uint8_t packet[4] = {cin, status, data1, data2};
+        if (!tud_midi_packet_write(packet))
+        {
+            return;
+        }
+    }
+    else if (wheelMode == WheelMode::ModWheel)
+    {
+        MIDI.sendControlChange(MOD_WHEEL_CC, data2, MIDI_CHANNEL);
     }
     else
     {
@@ -169,18 +282,25 @@ void drawStatus(int32_t midiValue)
 
     M5.Display.setTextSize(1);
     M5.Display.setCursor(6, 43);
-    M5.Display.print("BLE MIDI: ");
-    if (!pairingRequested)
+    if (tud_midi_mounted())
     {
-        M5.Display.println("OFF");
+        M5.Display.println("MIDI OUT: USB");
     }
     else if (midiConnected)
     {
-        M5.Display.println("CONNECTED");
+        M5.Display.println("MIDI OUT: BLUETOOTH");
+    }
+    else if (pairingRequested)
+    {
+        M5.Display.println("BLE: ADVERTISING");
+    }
+    else if (usbMidiStarted)
+    {
+        M5.Display.println("USB MIDI: WAITING");
     }
     else
     {
-        M5.Display.println("ADVERTISING");
+        M5.Display.println("MIDI: DISCONNECTED");
     }
 
     M5.Display.setCursor(6, 65);
@@ -211,7 +331,7 @@ void drawStatus(int32_t midiValue)
     M5.Display.setCursor(6, 125);
     M5.Display.println("Btn1: mode + zero");
     M5.Display.setCursor(6, 145);
-    M5.Display.println("Btn2: pair");
+    M5.Display.println("Btn2: BLE pair");
     M5.Display.setCursor(6, 177);
     M5.Display.println("Tilt X to move wheel");
 }
@@ -226,6 +346,7 @@ void setup()
     M5.Display.setRotation(0);
     M5.Display.fillScreen(TFT_BLACK);
 
+    startUsbMidi();
     Serial.println("M5 Mod Wheel ready");
     drawStatus(64);
 }
@@ -253,7 +374,6 @@ void loop()
     if (connected != previousMidiConnected)
     {
         previousMidiConnected = connected;
-        hasSentMidiValue = false;
         Serial.println(connected ? "BLE MIDI connected" : "BLE MIDI disconnected");
     }
 
