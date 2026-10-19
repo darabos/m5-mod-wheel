@@ -21,7 +21,9 @@ constexpr uint8_t MIDI_CHANNEL = 1;
 constexpr uint8_t MOD_WHEEL_CC = 1;
 constexpr float FULL_SCALE_TILT_DEGREES = 45.0f;
 constexpr float TILT_FILTER_ALPHA = 0.2f;
-constexpr uint32_t DISPLAY_REFRESH_MS = 100;
+constexpr uint32_t DISPLAY_REFRESH_MS = 33;
+constexpr uint32_t MOD_WHEEL_COLOR = 0xC6A0F6;
+constexpr uint32_t PITCH_BEND_COLOR = 0xA6E3A1;
 
 enum class WheelMode : uint8_t
 {
@@ -39,7 +41,8 @@ enum class MidiTransport : uint8_t
 volatile bool midiConnected = false;
 bool bleStarted = false;
 bool pairingRequested = false;
-bool usbMidiStarted = false;
+M5Canvas displayBuffer(&M5.Display);
+bool displayBufferReady = false;
 bool hasTiltReading = false;
 bool hasZeroPose = false;
 bool hasSentMidiValue = false;
@@ -146,7 +149,6 @@ bool startUsbMidi()
         return false;
     }
 
-    usbMidiStarted = true;
     Serial.println("USB MIDI started");
     return true;
 }
@@ -272,68 +274,57 @@ void sendWheelValue(int32_t midiValue)
     hasSentMidiValue = true;
 }
 
-void drawStatus(int32_t midiValue)
+void drawStatus()
 {
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(5, 8);
-    M5.Display.println(wheelMode == WheelMode::ModWheel ? "MOD WHEEL" : "PITCH BEND");
+    if (!displayBufferReady)
+    {
+        return;
+    }
 
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(6, 43);
+    const uint32_t color = wheelMode == WheelMode::ModWheel
+                               ? MOD_WHEEL_COLOR
+                               : PITCH_BEND_COLOR;
+    const int32_t leftWidth = 80;
+    const int32_t margin = 8;
+    const int32_t barHeight = 12;
+    const int32_t centerY = displayBuffer.height() / 2;
+    const int32_t travel = centerY - margin - barHeight / 2;
+    const float position = hasZeroPose ? normalizedWheelPosition() : 0.0f;
+    const int32_t barY = centerY - barHeight / 2 -
+                         static_cast<int32_t>(std::lround(position * travel));
+
+    displayBuffer.fillSprite(TFT_BLACK);
+    displayBuffer.setTextColor(color, TFT_BLACK);
+    displayBuffer.setTextDatum(middle_center);
+    displayBuffer.setTextSize(10);
+    displayBuffer.drawString(
+        wheelMode == WheelMode::ModWheel ? "M" : "P",
+        leftWidth / 2,
+        centerY - 15);
+
+    const char *connectionStatus = "";
     if (tud_midi_mounted())
     {
-        M5.Display.println("MIDI OUT: USB");
+        connectionStatus = "USB";
     }
     else if (midiConnected)
     {
-        M5.Display.println("MIDI OUT: BLUETOOTH");
+        connectionStatus = "CONN";
     }
     else if (pairingRequested)
     {
-        M5.Display.println("BLE: ADVERTISING");
-    }
-    else if (usbMidiStarted)
-    {
-        M5.Display.println("USB MIDI: WAITING");
-    }
-    else
-    {
-        M5.Display.println("MIDI: DISCONNECTED");
+        connectionStatus = "PAIR";
     }
 
-    M5.Display.setCursor(6, 65);
-    if (hasZeroPose)
-    {
-        if (wheelMode == WheelMode::ModWheel)
-        {
-            M5.Display.print("CC 1 value: ");
-            M5.Display.println(midiValue);
-        }
-        else
-        {
-            M5.Display.print("Bend value: ");
-            M5.Display.println(midiValue + 8192);
-        }
-
-        M5.Display.setCursor(6, 85);
-        M5.Display.print("Tilt: ");
-        M5.Display.print(filteredTiltDegrees - zeroTiltDegrees, 1);
-        M5.Display.println(" deg");
-    }
-    else
-    {
-        M5.Display.println("Waiting for IMU...");
-    }
-
-    M5.Display.drawFastHLine(5, 112, M5.Display.width() - 10, TFT_DARKGREY);
-    M5.Display.setCursor(6, 125);
-    M5.Display.println("Btn1: mode + zero");
-    M5.Display.setCursor(6, 145);
-    M5.Display.println("Btn2: BLE pair");
-    M5.Display.setCursor(6, 177);
-    M5.Display.println("Tilt X to move wheel");
+    displayBuffer.setTextSize(2);
+    displayBuffer.drawString(connectionStatus, leftWidth / 2, displayBuffer.height() - 22);
+    displayBuffer.fillRect(
+        leftWidth + margin,
+        barY,
+        displayBuffer.width() - leftWidth - 2 * margin,
+        barHeight,
+        color);
+    displayBuffer.pushSprite(0, 0);
 }
 } // namespace
 
@@ -343,12 +334,20 @@ void setup()
     M5.begin(config);
 
     Serial.begin(115200);
-    M5.Display.setRotation(0);
+    M5.Display.setRotation(1);
     M5.Display.fillScreen(TFT_BLACK);
+    displayBuffer.setColorDepth(16);
+    displayBufferReady = displayBuffer.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
+    if (!displayBufferReady)
+    {
+        Serial.println("ERROR: Could not allocate display buffer");
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.println("Display buffer allocation failed");
+    }
 
     startUsbMidi();
     Serial.println("M5 Mod Wheel ready");
-    drawStatus(64);
+    drawStatus();
 }
 
 void loop()
@@ -394,13 +393,13 @@ void loop()
 
         const int32_t midiValue = wheelMidiValue(normalizedWheelPosition());
         sendWheelValue(midiValue);
+    }
 
-        const uint32_t now = millis();
-        if (static_cast<int32_t>(now - nextDisplayRefreshMs) >= 0)
-        {
-            drawStatus(midiValue);
-            nextDisplayRefreshMs = now + DISPLAY_REFRESH_MS;
-        }
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - nextDisplayRefreshMs) >= 0)
+    {
+        drawStatus();
+        nextDisplayRefreshMs = now + DISPLAY_REFRESH_MS;
     }
 
     delay(5);
