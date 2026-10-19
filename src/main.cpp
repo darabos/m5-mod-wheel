@@ -24,6 +24,8 @@ constexpr float TILT_FILTER_ALPHA = 0.2f;
 constexpr uint32_t DISPLAY_REFRESH_MS = 33;
 constexpr uint32_t MOD_WHEEL_COLOR = 0xC6A0F6;
 constexpr uint32_t PITCH_BEND_COLOR = 0xA6E3A1;
+constexpr int32_t PITCH_GUIDE_RANGE_SEMITONES = 2;
+constexpr uint32_t PITCH_GUIDE_COLOR = 0x30402E;
 
 enum class WheelMode : uint8_t
 {
@@ -318,6 +320,22 @@ void drawStatus()
 
     displayBuffer.setTextSize(2);
     displayBuffer.drawString(connectionStatus, leftWidth / 2, displayBuffer.height() - 22);
+    if (wheelMode == WheelMode::PitchBend)
+    {
+        for (int32_t semitone = -PITCH_GUIDE_RANGE_SEMITONES;
+             semitone <= PITCH_GUIDE_RANGE_SEMITONES;
+             ++semitone)
+        {
+            const float guidePosition = static_cast<float>(semitone) / PITCH_GUIDE_RANGE_SEMITONES;
+            const int32_t guideY = centerY -
+                                   static_cast<int32_t>(std::lround(guidePosition * travel));
+            displayBuffer.drawFastHLine(
+                leftWidth + margin,
+                guideY,
+                displayBuffer.width() - leftWidth - 2 * margin,
+                PITCH_GUIDE_COLOR);
+        }
+    }
     displayBuffer.fillRect(
         leftWidth + margin,
         barY,
