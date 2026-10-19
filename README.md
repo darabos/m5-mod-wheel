@@ -16,6 +16,8 @@ The landscape display shows a large light-purple `M` for mod wheel or light-gree
 
 A wide horizontal bar on the right matches the mode color. It is vertically centered at the zero pose, moves up as the wheel value increases and down as it decreases, and stops at the limits. Frames are drawn into an off-screen buffer before being displayed to avoid flickering.
 
+Framework logging is limited to warnings and errors (`CORE_DEBUG_LEVEL=2`). Verbose BLE logging prints each MIDI notification and blocks on serial output, slowing both motion sampling and display refresh.
+
 ## MIDI output
 
 - Mod-wheel mode sends Control Change 1 on MIDI channel 1. The zero pose maps to 64; tilting in either direction moves the value toward 0 or 127.
