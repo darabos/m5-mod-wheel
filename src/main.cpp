@@ -1,389 +1,287 @@
-#include <LittleFS.h>
 #include <M5Unified.h>
 
-// ------------------------------------------------------------
-// Settings
-// ------------------------------------------------------------
+#include <cmath>
+#include <cstdint>
 
-// 16 kHz mono, 16-bit PCM is plenty for speech.
-static constexpr uint32_t SAMPLE_RATE = 16000;
+#include <BLEMIDI_Transport.h>
+#include <hardware/BLEMIDI_ESP32.h>
 
-static float playbackSpeedMultiplier = 1.0f;
-static bool playbackActive = false;
-static uint32_t nextAnimationFrameMs = 0;
-static uint8_t playbackFrameIndex = 0;
-static float lastTiltMultiplier = 1.0f;
-M5Canvas canvas = M5Canvas(&M5.Display);
+BLEMIDI_CREATE_INSTANCE("M5 Mod Wheel", MIDI)
 
-static void updatePlaybackSpeedFromTilt()
+namespace
 {
-    auto imuUpdate = M5.Imu.update();
-    if (!imuUpdate)
-    {
-        return;
-    }
+constexpr uint8_t MIDI_CHANNEL = 1;
+constexpr uint8_t MOD_WHEEL_CC = 1;
+constexpr float FULL_SCALE_TILT_DEGREES = 45.0f;
+constexpr float TILT_FILTER_ALPHA = 0.2f;
+constexpr uint32_t DISPLAY_REFRESH_MS = 100;
 
-    auto imuData = M5.Imu.getImuData();
-    float tiltMultiplier = 1.0f + (imuData.gyro.x / 600.0f);
-    tiltMultiplier = constrain(tiltMultiplier, 0.5f, 3.0f);
+enum class WheelMode : uint8_t
+{
+    ModWheel,
+    PitchBend,
+};
 
-    if (fabs(tiltMultiplier - lastTiltMultiplier) > 0.05f)
-    {
-        lastTiltMultiplier = tiltMultiplier;
-        playbackSpeedMultiplier = tiltMultiplier;
+volatile bool midiConnected = false;
+bool bleStarted = false;
+bool pairingRequested = false;
+bool hasTiltReading = false;
+bool hasZeroPose = false;
+bool hasSentMidiValue = false;
+bool previousMidiConnected = false;
+WheelMode wheelMode = WheelMode::ModWheel;
+float filteredTiltDegrees = 0.0f;
+float zeroTiltDegrees = 0.0f;
+int32_t lastSentMidiValue = 0;
+uint32_t nextDisplayRefreshMs = 0;
 
-        if (playbackActive)
-        {
-            playRecording();
-        }
-    }
+void onMidiConnected()
+{
+    midiConnected = true;
 }
 
-static void showCactusImage(const char *path)
+void onMidiDisconnected()
 {
-    if (!LittleFS.exists(path))
-    {
-        Serial.print("Missing image: ");
-        Serial.println(path);
-        return;
-    }
-
-    canvas.fillSprite(TFT_BLACK);
-    canvas.drawPngFile(LittleFS, path);
-    canvas.pushSprite(0, 0);
+    midiConnected = false;
 }
 
-// Maximum recording time.
-// 10 seconds × 16000 samples × 2 bytes = 320 KB.
-static constexpr uint32_t MAX_RECORD_SECONDS = 10;
-
-static constexpr size_t MAX_SAMPLES =
-    SAMPLE_RATE * MAX_RECORD_SECONDS;
-
-// Audio buffer.
-// Allocated in PSRAM because the StickS3 has 8 MB PSRAM.
-int16_t *recording = nullptr;
-
-size_t recordedSamples = 0;
-bool wasRecording = false;
-
-// ------------------------------------------------------------
-// Start recording
-// ------------------------------------------------------------
-
-void startRecording()
+bool readTiltDegrees(float &tiltDegrees)
 {
-    if (recording == nullptr)
+    if (!M5.Imu.update())
     {
-        Serial.println("ERROR: recording buffer not allocated");
-        return;
+        return false;
     }
 
-    recordedSamples = 0;
-    wasRecording = true;
+    const auto &imuData = M5.Imu.getImuData();
+    const float x = imuData.accel.x;
+    const float y = imuData.accel.y;
+    const float z = imuData.accel.z;
+    const float transverseMagnitude = std::sqrt(y * y + z * z);
+    const float magnitude = std::sqrt(x * x + transverseMagnitude * transverseMagnitude);
 
-    // The microphone and speaker cannot be used simultaneously.
-    M5.Speaker.end();
-
-    if (!M5.Mic.isEnabled())
+    if (magnitude < 0.1f)
     {
-        M5.Mic.begin();
+        return false;
     }
 
-    showCactusImage("/cactus6.png");
-
-    Serial.println("Recording started");
+    tiltDegrees = std::atan2(x, transverseMagnitude) * (180.0f / PI);
+    return true;
 }
 
-// ------------------------------------------------------------
-// Record audio while Button 1 is held
-// ------------------------------------------------------------
-
-void recordAudio()
+void startPairing()
 {
-    if (!M5.Mic.isEnabled())
+    if (bleStarted)
     {
         return;
     }
 
-    // Record in relatively small chunks so we can continuously
-    // check the button and stop as soon as it is released.
-    static constexpr size_t CHUNK_SAMPLES = 256;
+    BLEMIDI.setHandleConnected(onMidiConnected);
+    BLEMIDI.setHandleDisconnected(onMidiDisconnected);
+    MIDI.begin();
 
-    if (recordedSamples >= MAX_SAMPLES)
-    {
-        return;
-    }
-
-    size_t remaining = MAX_SAMPLES - recordedSamples;
-    size_t samplesToRecord =
-        min(CHUNK_SAMPLES, remaining);
-
-    if (M5.Mic.record(
-            &recording[recordedSamples],
-            samplesToRecord,
-            SAMPLE_RATE))
-    {
-
-        recordedSamples += samplesToRecord;
-    }
+    bleStarted = true;
+    pairingRequested = true;
+    Serial.println("BLE MIDI advertising started");
 }
 
-// ------------------------------------------------------------
-// Stop recording
-// ------------------------------------------------------------
-
-void stopRecording()
+void setZeroPoseAndMode()
 {
-    if (!wasRecording)
+    float currentTiltDegrees = 0.0f;
+    if (!readTiltDegrees(currentTiltDegrees))
     {
+        Serial.println("Cannot change mode: IMU reading unavailable");
         return;
     }
 
-    wasRecording = false;
+    filteredTiltDegrees = currentTiltDegrees;
+    hasTiltReading = true;
+    zeroTiltDegrees = currentTiltDegrees;
+    hasZeroPose = true;
+    wheelMode = wheelMode == WheelMode::ModWheel
+                    ? WheelMode::PitchBend
+                    : WheelMode::ModWheel;
+    hasSentMidiValue = false;
 
-    // Wait for the current microphone operation to finish.
-    while (M5.Mic.isRecording())
-    {
-        delay(1);
-    }
-
-    M5.Mic.end();
-
-    showCactusImage("/cactus5.png");
-
-    Serial.print("Recording stopped. Samples: ");
-    Serial.println(recordedSamples);
+    Serial.print("Mode changed and zero pose captured: ");
+    Serial.println(wheelMode == WheelMode::ModWheel ? "Mod Wheel" : "Pitch Bend");
 }
 
-// ------------------------------------------------------------
-// Play recording
-// ------------------------------------------------------------
-
-void playRecording()
+float normalizedWheelPosition()
 {
-    if (recordedSamples == 0)
+    float position = (filteredTiltDegrees - zeroTiltDegrees) / FULL_SCALE_TILT_DEGREES;
+    if (position < -1.0f)
     {
-        Serial.println("Nothing recorded");
+        position = -1.0f;
+    }
+    else if (position > 1.0f)
+    {
+        position = 1.0f;
+    }
+    return position;
+}
 
-        M5.Display.fillScreen(TFT_BLACK);
-        M5.Display.setTextColor(TFT_YELLOW);
-        M5.Display.setTextSize(2);
-        M5.Display.setCursor(10, 20);
-        M5.Display.println("NO RECORDING");
+int32_t wheelMidiValue(float position)
+{
+    if (wheelMode == WheelMode::ModWheel)
+    {
+        return static_cast<int32_t>(std::lround((position + 1.0f) * 63.5f));
+    }
 
-        delay(500);
+    int32_t pitchBend = static_cast<int32_t>(std::lround(position * 8192.0f));
+    if (pitchBend < -8192)
+    {
+        pitchBend = -8192;
+    }
+    else if (pitchBend > 8191)
+    {
+        pitchBend = 8191;
+    }
+    return pitchBend;
+}
+
+void sendWheelValue(int32_t midiValue)
+{
+    if (!bleStarted || !midiConnected || (hasSentMidiValue && midiValue == lastSentMidiValue))
+    {
         return;
     }
 
-    static constexpr uint32_t TRIM_MS = 100;
-    static constexpr size_t TRIM_SAMPLES = (SAMPLE_RATE * TRIM_MS) / 1000;
-
-    size_t playbackSamples = recordedSamples;
-    int16_t *playbackBuffer = recording;
-
-    if (playbackSamples > TRIM_SAMPLES)
+    if (wheelMode == WheelMode::ModWheel)
     {
-        playbackBuffer = recording + TRIM_SAMPLES;
-        playbackSamples -= TRIM_SAMPLES * 2;
+        MIDI.sendControlChange(MOD_WHEEL_CC, static_cast<uint8_t>(midiValue), MIDI_CHANNEL);
     }
     else
     {
-        playbackBuffer = recording;
-        playbackSamples = 0;
+        MIDI.sendPitchBend(static_cast<int>(midiValue), MIDI_CHANNEL);
     }
 
-    if (playbackSamples == 0)
-    {
-        Serial.println("Recording too short after trim");
-        return;
-    }
-
-    uint32_t playbackRate = (uint32_t)(SAMPLE_RATE * playbackSpeedMultiplier + 0.5f);
-    if (playbackRate == 0)
-    {
-        playbackRate = SAMPLE_RATE;
-    }
-
-    Serial.print("Playback started at ");
-    Serial.print(playbackSpeedMultiplier, 2);
-    Serial.print("x (rate: ");
-    Serial.print(playbackRate);
-    Serial.println(" Hz)");
-
-    nextAnimationFrameMs = millis() + 180;
-    playbackFrameIndex = 0;
-    char framePath[32];
-    snprintf(framePath, sizeof(framePath), "/cactus%d.png", playbackFrameIndex + 1);
-    showCactusImage(framePath);
-
-    // If we are restarting playback mid-stream, make sure the
-    // previous output is fully stopped before starting the next one.
-    if (M5.Speaker.isPlaying())
-    {
-        M5.Speaker.end();
-    }
-
-    // Start the speaker.
-    M5.Speaker.begin();
-
-    // Keep volume reasonable, especially when running from
-    // the battery.
-    M5.Speaker.setVolume(180);
-
-    // Play the raw 16-bit mono PCM buffer.
-    M5.Speaker.playRaw(
-        playbackBuffer,
-        playbackSamples,
-        playbackRate,
-        false, // stereo = false
-        1,     // repeat count
-        0      // channel
-    );
-
-    playbackActive = true;
+    lastSentMidiValue = midiValue;
+    hasSentMidiValue = true;
 }
 
-// ------------------------------------------------------------
-// Setup
-// ------------------------------------------------------------
+void drawStatus(int32_t midiValue)
+{
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(5, 8);
+    M5.Display.println(wheelMode == WheelMode::ModWheel ? "MOD WHEEL" : "PITCH BEND");
+
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(6, 43);
+    M5.Display.print("BLE MIDI: ");
+    if (!pairingRequested)
+    {
+        M5.Display.println("OFF");
+    }
+    else if (midiConnected)
+    {
+        M5.Display.println("CONNECTED");
+    }
+    else
+    {
+        M5.Display.println("ADVERTISING");
+    }
+
+    M5.Display.setCursor(6, 65);
+    if (hasZeroPose)
+    {
+        if (wheelMode == WheelMode::ModWheel)
+        {
+            M5.Display.print("CC 1 value: ");
+            M5.Display.println(midiValue);
+        }
+        else
+        {
+            M5.Display.print("Bend value: ");
+            M5.Display.println(midiValue + 8192);
+        }
+
+        M5.Display.setCursor(6, 85);
+        M5.Display.print("Tilt: ");
+        M5.Display.print(filteredTiltDegrees - zeroTiltDegrees, 1);
+        M5.Display.println(" deg");
+    }
+    else
+    {
+        M5.Display.println("Waiting for IMU...");
+    }
+
+    M5.Display.drawFastHLine(5, 112, M5.Display.width() - 10, TFT_DARKGREY);
+    M5.Display.setCursor(6, 125);
+    M5.Display.println("Btn1: mode + zero");
+    M5.Display.setCursor(6, 145);
+    M5.Display.println("Btn2: pair");
+    M5.Display.setCursor(6, 177);
+    M5.Display.println("Tilt X to move wheel");
+}
+} // namespace
 
 void setup()
 {
-    auto cfg = M5.config();
-
-    M5.begin(cfg);
+    auto config = M5.config();
+    M5.begin(config);
 
     Serial.begin(115200);
-    delay(500);
-
-    canvas.createSprite(135, 240);
     M5.Display.setRotation(0);
     M5.Display.fillScreen(TFT_BLACK);
 
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.setCursor(10, 10);
-    M5.Display.println("Voice Recorder");
-
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 45);
-    M5.Display.println("Hold Btn1: Record");
-    M5.Display.setCursor(10, 65);
-    M5.Display.println("Press Btn2: Playback");
-
-    // Allocate the audio buffer from PSRAM.
-    recording = (int16_t *)heap_caps_malloc(
-        MAX_SAMPLES * sizeof(int16_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (recording == nullptr)
-    {
-        M5.Display.setTextColor(TFT_RED);
-        M5.Display.setCursor(10, 100);
-        M5.Display.println("PSRAM allocation FAILED!");
-
-        Serial.println("ERROR: Could not allocate recording buffer");
-        return;
-    }
-
-    Serial.print("Audio buffer allocated: ");
-    Serial.print(MAX_SAMPLES * sizeof(int16_t));
-    Serial.println(" bytes");
-
-    if (!LittleFS.begin(true))
-    {
-        Serial.println("LittleFS mount failed");
-    }
-    else
-    {
-        Serial.println("LittleFS ready");
-    }
-
-    showCactusImage("/cactus5.png");
-
-    Serial.println("Ready.");
+    Serial.println("M5 Mod Wheel ready");
+    drawStatus(64);
 }
-
-// ------------------------------------------------------------
-// Main loop
-// ------------------------------------------------------------
 
 void loop()
 {
     M5.update();
 
-    if (playbackActive)
+    if (M5.BtnA.wasClicked())
     {
-        updatePlaybackSpeedFromTilt();
-
-        if (millis() >= nextAnimationFrameMs)
-        {
-            nextAnimationFrameMs = millis() + 180 / playbackSpeedMultiplier;
-            playbackFrameIndex = (playbackFrameIndex + 1) % 4;
-            char framePath[32];
-            snprintf(framePath, sizeof(framePath), "/cactus%d.png", playbackFrameIndex + 1);
-            showCactusImage(framePath);
-        }
+        startPairing();
     }
-    else
+
+    if (M5.BtnB.wasClicked())
     {
+        setZeroPoseAndMode();
+    }
 
-        // --------------------------------------------------------
-        // Button 1 held = record
-        // --------------------------------------------------------
+    if (bleStarted)
+    {
+        MIDI.read();
+    }
 
-        if (M5.BtnB.isPressed())
+    const bool connected = midiConnected;
+    if (connected != previousMidiConnected)
+    {
+        previousMidiConnected = connected;
+        hasSentMidiValue = false;
+        Serial.println(connected ? "BLE MIDI connected" : "BLE MIDI disconnected");
+    }
+
+    float currentTiltDegrees = 0.0f;
+    if (readTiltDegrees(currentTiltDegrees))
+    {
+        if (!hasTiltReading)
         {
-
-            // Button has just been pressed.
-            if (!wasRecording)
-            {
-                startRecording();
-            }
-
-            // Continue recording.
-            recordAudio();
-
-            // Maximum recording time reached.
-            if (recordedSamples >= MAX_SAMPLES)
-            {
-                stopRecording();
-            }
+            filteredTiltDegrees = currentTiltDegrees;
+            zeroTiltDegrees = currentTiltDegrees;
+            hasTiltReading = true;
+            hasZeroPose = true;
         }
         else
         {
-            // Button 1 released.
-            if (wasRecording)
-            {
-                stopRecording();
-            }
+            filteredTiltDegrees += TILT_FILTER_ALPHA * (currentTiltDegrees - filteredTiltDegrees);
         }
 
-        // --------------------------------------------------------
-        // Button 2 = playback
-        // --------------------------------------------------------
+        const int32_t midiValue = wheelMidiValue(normalizedWheelPosition());
+        sendWheelValue(midiValue);
 
-        if (M5.BtnA.wasClicked())
+        const uint32_t now = millis();
+        if (static_cast<int32_t>(now - nextDisplayRefreshMs) >= 0)
         {
-
-            // Don't try to play while recording.
-            if (!wasRecording)
-            {
-                playRecording();
-            }
+            drawStatus(midiValue);
+            nextDisplayRefreshMs = now + DISPLAY_REFRESH_MS;
         }
     }
 
-    if (playbackActive && !M5.Speaker.isPlaying())
-    {
-        playbackActive = false;
-        playbackSpeedMultiplier = 1.0f;
-        lastTiltMultiplier = 1.0f;
-
-        Serial.println("Playback finished");
-        showCactusImage("/cactus7.png");
-    }
-
-    delay(1);
+    delay(5);
 }
