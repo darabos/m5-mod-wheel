@@ -349,6 +349,9 @@ void drawStatus()
 void setup()
 {
     auto config = M5.config();
+    config.output_power = false;
+    config.internal_spk = false;
+    config.external_rtc = false;
     M5.begin(config);
 
     Serial.begin(115200);

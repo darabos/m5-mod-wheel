@@ -2,6 +2,8 @@
 
 An application for the M5StickS3 that acts as a USB or Bluetooth MIDI mod wheel or pitch wheel.
 
+- Install it from M5 Burner: https://burner.m5stack.com/share/firmware/SQC88F
+
 ## USB MIDI
 
 Connect the M5StickS3 with a data-capable cable. The display shows `USB` when connected.
