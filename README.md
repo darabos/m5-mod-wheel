@@ -4,26 +4,23 @@ An application for the M5StickS3 that acts as a USB or Bluetooth MIDI mod wheel 
 
 ## USB MIDI
 
-Connect the M5StickS3 to a USB host with a data-capable cable. It appears as `M5 Mod Wheel` and uses USB MIDI whenever the host is connected. USB MIDI takes priority over Bluetooth automatically; disconnect USB to use Bluetooth MIDI.
+Connect the M5StickS3 with a data-capable cable. The display shows `USB` when connected.
+
+## Bluetooth MIDI
+
+Press the side button to start Bluetooth pairing. The display shows `PAIR`.
+Pair with the device named `M5 Mod Wheel`. The display then shows `CONN`.
+
+On macOS, BLE MIDI do not appear in System Settings > Bluetooth like headphones.
+See [Set up Bluetooth MIDI devices in Audio MIDI Setup on Mac](https://support.apple.com/en-euro/guide/audio-midi-setup/ams33f013765/mac).
 
 ## Controls
 
-- Press button 2 to start Bluetooth MIDI advertising. Pair with the device named `M5 Mod Wheel`; it remains discoverable until connected and resumes advertising after a disconnect. Bluetooth is used when USB MIDI is not connected.
-- Press button 1 to switch between mod-wheel and pitch-bend modes. Each press also captures the current orientation as the zero pose.
-- Tilt along the X axis to change the MIDI value. The value reaches its minimum or maximum at 45 degrees from the captured pose and is clamped beyond that range.
-
-The display shows a purple `M` for mod wheel or green `P` for pitch bend mode. Below it, `USB` indicates USB MIDI, `PAIR` indicates Bluetooth advertising, and `CONN` indicates a successful Bluetooth connection.
-
+- Press the front button to switch between mod-wheel and pitch-bend modes.
+  Each press also captures the current orientation as the zero pose.
+- Tilt up and down to change the MIDI value.
 
 ## MIDI output
 
 - Mod-wheel mode sends Control Change 1 on MIDI channel 1. The zero pose maps to 64; tilting in either direction moves the value toward 0 or 127.
 - Pitch-bend mode sends standard 14-bit pitch-bend values on MIDI channel 1, centered at 8192 in the 0–16383 range. The zero pose is the center; tilting reaches the bend limits.
-
-## Bluetooth MIDI on macOS
-
-On macOS, BLE MIDI devices usually do not appear in System Settings > Bluetooth like headphones.
-Open Applications > Utilities > Audio MIDI Setup, choose Window > Show MIDI Studio,
-then open Bluetooth Configuration and connect to “M5 Mod Wheel” while button 2 is advertising.
-
-Apple’s guide: [Set up Bluetooth MIDI devices on Mac](https://support.apple.com/guide/audio-midi-setup/connect-bluetooth-midi-devices-ams6d6bc021a/mac).

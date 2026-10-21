@@ -372,12 +372,12 @@ void loop()
 {
     M5.update();
 
-    if (M5.BtnA.wasClicked())
+    if (M5.BtnB.wasClicked())
     {
         startPairing();
     }
 
-    if (M5.BtnB.wasClicked())
+    if (M5.BtnA.wasClicked())
     {
         setZeroPoseAndMode();
     }
